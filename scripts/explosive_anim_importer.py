@@ -26,6 +26,7 @@
 import bpy
 import os
 import math
+from bpy_extras import anim_utils
 
 
 # linux example path
@@ -61,73 +62,130 @@ else:
         # Remove the collection itself
         bpy.data.collections.remove(collection)
         
+    main_armature = None
+
     # Search Folder for FBX files.
-    for filename in os.listdir(folder_path):
+    for filename in sorted(os.listdir(folder_path)):
         if not filename.endswith(".FBX"):
             continue
 
         file_path = os.path.join(folder_path, filename)
-        print(file_path)
+        print(f"Importing: {file_path}")
+
+        # Snapshot state before import so we can find what was added
+        actions_before = set(bpy.data.actions.keys())
+        objects_before = set(bpy.data.objects.keys())
+
         # Import the file
-        bpy.ops.import_scene.fbx(filepath=file_path, automatic_bone_orientation=True)
+        bpy.ops.wm.fbx_import(filepath=file_path)
+
+        # Find newly created objects and actions
+        new_object_names = set(bpy.data.objects.keys()) - objects_before
+        new_action_names = set(bpy.data.actions.keys()) - actions_before
 
         # Look for weapon name and remove it
-        for object in bpy.context.scene.objects:
-            if object.name == weapon:
-                mesh_object = bpy.data.objects[weapon] 
-                
-                # Delete the mesh object.
-                bpy.data.objects.remove(mesh_object)
-                
-                # Get the action to delete.
-                action = bpy.data.actions[weapon + "|Take 001|BaseLayer"]
-                
-                # Delete the action.
-                bpy.data.actions.remove(action)
+        if weapon in new_object_names:
+            bpy.data.objects.remove(bpy.data.objects[weapon])
+            new_object_names.discard(weapon)
+            # Remove any weapon-related actions
+            weapon_actions = [n for n in new_action_names if weapon in n]
+            for wa in weapon_actions:
+                bpy.data.actions.remove(bpy.data.actions[wa])
+                new_action_names.discard(wa)
 
-        # Get the action
+        # Find the action created by this import
         action = None
-        obj = bpy.context.selected_objects[0]
-        if obj.animation_data:
-            action = obj.animation_data.action
-            
-            # Remove root motion fcurves
-            if remove_root_motion:
-                for fcurve in obj.animation_data.action.fcurves:
-                    if "Motion" in fcurve.data_path and "location" in fcurve.data_path:
-                            action.fcurves.remove(fcurve)
+        action_slot = None
+        for name in new_action_names:
+            action = bpy.data.actions[name]
+            break
 
         if not action:
-            print(f"Warning: '{filename}' doesn't contain an animation.")
+            print(f"  Warning: '{filename}' didn't create any animation action.")
+            for obj_name in new_object_names:
+                if obj_name in bpy.data.objects:
+                    bpy.data.objects.remove(bpy.data.objects[obj_name])
             continue
 
-        # Rename the action, this removes the first part of the file name so just the action is left
-        # Update "RPG-Character@Unarmed-" with the prefix to be removed
+        # Remove root motion fcurves
+        if remove_root_motion:
+            for slot in action.slots:
+                channelbag = anim_utils.action_get_channelbag_for_slot(action, slot)
+                if channelbag:
+                    fcurves_to_remove = [
+                        fc for fc in channelbag.fcurves
+                        if "Motion" in fc.data_path and "location" in fc.data_path
+                    ]
+                    for fc in fcurves_to_remove:
+                        channelbag.fcurves.remove(fc)
+
+        # Rename the action
         action.name = os.path.splitext(filename)[0].replace("RPG-Character@", "").replace("-", "")
+        action.use_fake_user = True
 
-        # Delete all but the first armature and first mesh
-        for object in bpy.context.scene.objects:
-            if object.name == "Armature.001" or object.name == "RPG-Character-Mesh.001":
-                bpy.data.objects.remove(object)
+        # Identify the main armature on first import, delete duplicates on subsequent imports
+        new_armature = None
+        new_meshes = []
+        for obj_name in new_object_names:
+            if obj_name not in bpy.data.objects:
+                continue
+            obj = bpy.data.objects[obj_name]
+            if obj.type == 'ARMATURE':
+                new_armature = obj
+            elif obj.type == 'MESH':
+                new_meshes.append(obj)
 
-            # If True then delete final mesh
-            elif object.name == "RPG-Character-Mesh":
-                if remove_mesh == True:
-                    bpy.data.objects.remove(object)
-                
+        if main_armature is None:
+            # First import — keep this armature, slot is already correctly bound
+            main_armature = new_armature
+            if remove_mesh:
+                for m in new_meshes:
+                    bpy.data.objects.remove(m)
+        else:
+            # Subsequent imports — rebind the action's slot to main_armature
+            # The importer bound the slot to the new (duplicate) armature, so the
+            # Action Editor can't resolve bone channels unless we rebind it.
+            old_slot = action.slots[0] if action.slots else None
+            if old_slot:
+                old_cb = anim_utils.action_get_channelbag_for_slot(action, old_slot)
+                new_slot = action.slots.new(id_type='OBJECT', name=main_armature.name)
+                new_cb = anim_utils.action_ensure_channelbag_for_slot(action, new_slot)
+                if old_cb:
+                    for old_fc in list(old_cb.fcurves):
+                        new_fc = new_cb.fcurves.new(old_fc.data_path, index=old_fc.array_index)
+                        kp_count = len(old_fc.keyframe_points)
+                        if kp_count > 0:
+                            new_fc.keyframe_points.add(kp_count)
+                            co = [0.0] * (kp_count * 2)
+                            old_fc.keyframe_points.foreach_get('co', co)
+                            new_fc.keyframe_points.foreach_set('co', co)
+                            new_fc.update()
+                action.slots.remove(old_slot)
 
-        # Rotate the animation to face 180 degrees Z so it faces forward in godot
-        if rotate_z == True:
-            rot_obj = bpy.data.objects["Armature"]
-            rot_obj.select_set(True)
-            rot_obj.rotation_euler = [math.radians(90), 0.0, math.radians(180)]
-            bpy.context.view_layer.update()
-           
+            # Delete the duplicate armature and meshes
+            if new_armature is not None:
+                bpy.data.objects.remove(new_armature)
+            for m in new_meshes:
+                bpy.data.objects.remove(m)
 
-        
-        print(f"Imported and renamed animation action for '{filename}' to '{action.name}'")
-        
-        
+        # Assign the action to the main armature
+        if main_armature:
+            if main_armature.animation_data is None:
+                main_armature.animation_data_create()
+            main_armature.animation_data.action = action
+            # Find the slot bound to main_armature
+            for slot in action.slots:
+                if slot.target_id_type == 'OBJECT':
+                    main_armature.animation_data.action_slot = slot
+                    break
+
+        print(f"  Imported animation: '{action.name}'")
+
+    # Rotate the armature to face forward in Godot
+    if rotate_z and main_armature:
+        main_armature.rotation_euler = [math.radians(90), 0.0, math.radians(180)]
+        bpy.context.view_layer.update()
+
     # Export File
     #bpy.ops.export_scene.glb(filepath=export_file_path, export_selected=False)
 
