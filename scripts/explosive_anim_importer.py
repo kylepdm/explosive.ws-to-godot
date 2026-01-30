@@ -29,14 +29,14 @@ import math
 from bpy_extras import anim_utils
 
 # linux example path
-folder_path = "/home/kylepdm/Downloads/rpg_ani/Unarmed"
+folder_path = "/home/scot/godot/Assets/Animations/ExplosiveLLC/RPG Animation FBX-0.0.6/Relax"
 
 # windows example path
 #folder_path =  "C:\\Users\\Scot\\Animations\\ExplosiveLLC\\RPG Animation FBX-0.0.0\\Relax"
 
 
 # Setup some variables
-rotate_z = False # rotate the animation by 180 on Z
+rotate_z = True # rotate the animation by 180 on Z
 remove_root_motion = True # remove the root motion location fcurves from animations, root rotation and root scale fcurves are not removed.
 
 remove_mesh = False # Experimental: remove the final mesh inside the armature that causes warnings in Godot
